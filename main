@@ -1,0 +1,272 @@
+import telebot
+from telebot import types
+import logging
+
+from config import TELEGRAM_TOKEN
+from drive_service import (
+    extract_folder_id, extract_file_id,
+    copy_files, move_file, delete_file, set_file_permission
+)
+
+logging.basicConfig(level=logging.INFO)
+
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
+
+# --- Управление состояниями (FSM) через словари ---
+user_states = {}  # хранит текущее состояние пользователя
+user_data = {}    # хранит промежуточные данные (ссылки, ID)
+
+# Состояния (можно использовать Enum, но для простоты - константы):
+STATE_NONE = 0
+
+# Копирование
+STATE_COPY_SOURCE = 1
+STATE_COPY_DEST = 2
+
+# Перемещение
+STATE_MOVE_FILE = 3
+STATE_MOVE_DEST = 4
+
+# Удаление
+STATE_DELETE_FILE = 5
+STATE_DELETE_CONFIRM = 6
+
+# Права доступа
+STATE_PERM_FILE = 7
+STATE_PERM_EMAIL = 8
+STATE_PERM_ROLE = 9
+
+def set_state(user_id, state):
+    user_states[user_id] = state
+
+def get_state(user_id):
+    return user_states.get(user_id, STATE_NONE)
+
+def set_user_data(user_id, key, value):
+    if user_id not in user_data:
+        user_data[user_id] = {}
+    user_data[user_id][key] = value
+
+def get_user_data(user_id, key, default=None):
+    return user_data.get(user_id, {}).get(key, default)
+
+def clear_user_data(user_id):
+    user_data[user_id] = {}
+
+# ---------- /start ----------
+@bot.message_handler(commands=['start'])
+def command_start(message):
+    """
+    Стартовая команда. Показывает пользователю кнопки для быстрого доступа к командам.
+    """
+    markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    btn_copy = types.KeyboardButton('/copy')
+    btn_move = types.KeyboardButton('/move')
+    btn_delete = types.KeyboardButton('/delete')
+    btn_setperm = types.KeyboardButton('/setpermissions')
+    btn_cancel = types.KeyboardButton('/cancel')
+    markup.add(btn_copy, btn_move, btn_delete, btn_setperm, btn_cancel)
+
+    bot.send_message(
+        message.chat.id,
+        "Привет! Я бот для работы с Google Drive.\n"
+        "Выберите команду или введите её вручную:\n"
+        "/copy – копировать файлы из папки в папку\n"
+        "/move – переместить файл\n"
+        "/delete – удалить файл\n"
+        "/setpermissions – изменить права доступа\n"
+        "/cancel – отменить текущую операцию",
+        reply_markup=markup
+    )
+
+    set_state(message.chat.id, STATE_NONE)
+    clear_user_data(message.chat.id)
+
+# ---------- /cancel ----------
+@bot.message_handler(commands=['cancel'])
+def command_cancel(message):
+    """
+    Отменяет текущее состояние пользователя.
+    """
+    set_state(message.chat.id, STATE_NONE)
+    clear_user_data(message.chat.id)
+    bot.reply_to(message, "Операция отменена.")
+
+# ---------- /copy ----------
+@bot.message_handler(commands=['copy'])
+def command_copy(message):
+    """
+    Запрашивает у пользователя ссылку на исходную папку.
+    """
+    bot.reply_to(message, "Введите ссылку на исходную папку (Google Drive):")
+    set_state(message.chat.id, STATE_COPY_SOURCE)
+    clear_user_data(message.chat.id)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_COPY_SOURCE)
+def copy_source_handler(message):
+    """
+    Обрабатывает ссылку на исходную папку.
+    """
+    folder_id = extract_folder_id(message.text)
+    if not folder_id:
+        bot.reply_to(message, "Не удалось извлечь ID папки. Попробуйте ещё раз или введите /cancel для отмены.")
+        return
+    set_user_data(message.chat.id, 'source_folder_id', folder_id)
+    bot.reply_to(message, "Теперь введите ссылку на целевую папку:")
+    set_state(message.chat.id, STATE_COPY_DEST)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_COPY_DEST)
+def copy_dest_handler(message):
+    """
+    Обрабатывает ссылку на целевую папку и копирует файлы.
+    """
+    folder_id = extract_folder_id(message.text)
+    if not folder_id:
+        bot.reply_to(message, "Не удалось извлечь ID папки. Попробуйте ещё раз или введите /cancel для отмены.")
+        return
+    source_folder_id = get_user_data(message.chat.id, 'source_folder_id')
+    copied_count = copy_files(source_folder_id, folder_id)
+    bot.reply_to(message, f"Копирование завершено. Скопировано файлов: {copied_count}")
+    set_state(message.chat.id, STATE_NONE)
+    clear_user_data(message.chat.id)
+
+# ---------- /move ----------
+@bot.message_handler(commands=['move'])
+def command_move(message):
+    """
+    Запрашивает у пользователя ссылку на файл, который нужно переместить.
+    """
+    bot.reply_to(message, "Введите ссылку на файл для перемещения:")
+    set_state(message.chat.id, STATE_MOVE_FILE)
+    clear_user_data(message.chat.id)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_MOVE_FILE)
+def move_file_handler(message):
+    """
+    Обрабатывает ссылку на файл и запрашивает ссылку на папку, куда переместить.
+    """
+    file_id = extract_file_id(message.text)
+    if not file_id:
+        bot.reply_to(message, "Не удалось извлечь ID файла. Попробуйте ещё раз или введите /cancel для отмены.")
+        return
+    set_user_data(message.chat.id, 'file_id', file_id)
+    bot.reply_to(message, "Введите ссылку на целевую папку:")
+    set_state(message.chat.id, STATE_MOVE_DEST)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_MOVE_DEST)
+def move_dest_handler(message):
+    """
+    Перемещает файл в указанную папку.
+    """
+    folder_id = extract_folder_id(message.text)
+    if not folder_id:
+        bot.reply_to(message, "Не удалось извлечь ID папки. Попробуйте ещё раз или введите /cancel для отмены.")
+        return
+    file_id = get_user_data(message.chat.id, 'file_id')
+    try:
+        updated_file = move_file(file_id, folder_id)
+        parents = updated_file.get('parents', [])
+        bot.reply_to(message, f"Файл успешно перемещён. Новые родительские папки: {parents}")
+    except Exception as e:
+        logging.error(f"Ошибка при перемещении файла: {e}")
+        bot.reply_to(message, "Произошла ошибка при перемещении файла.")
+    set_state(message.chat.id, STATE_NONE)
+    clear_user_data(message.chat.id)
+
+# ---------- /delete ----------
+@bot.message_handler(commands=['delete'])
+def command_delete(message):
+    """
+    Запрашивает у пользователя ссылку на файл для удаления.
+    """
+    bot.reply_to(message, "Введите ссылку на файл для удаления:")
+    set_state(message.chat.id, STATE_DELETE_FILE)
+    clear_user_data(message.chat.id)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_DELETE_FILE)
+def delete_file_handler(message):
+    """
+    Обрабатывает ссылку на файл и просит подтверждение удаления.
+    """
+    file_id = extract_file_id(message.text)
+    if not file_id:
+        bot.reply_to(message, "Не удалось извлечь ID файла. Попробуйте ещё раз или введите /cancel для отмены.")
+        return
+    set_user_data(message.chat.id, 'file_id', file_id)
+    bot.reply_to(message, "Для подтверждения удаления введите YES:")
+    set_state(message.chat.id, STATE_DELETE_CONFIRM)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_DELETE_CONFIRM)
+def delete_confirm_handler(message):
+    """
+    Удаляет файл после подтверждения.
+    """
+    if message.text.strip().upper() == "YES":
+        file_id = get_user_data(message.chat.id, 'file_id')
+        try:
+            delete_file(file_id)
+            bot.reply_to(message, "Файл успешно удалён.")
+        except Exception as e:
+            logging.error(f"Ошибка при удалении файла: {e}")
+            bot.reply_to(message, "Произошла ошибка при удалении файла.")
+    else:
+        bot.reply_to(message, "Удаление отменено.")
+    set_state(message.chat.id, STATE_NONE)
+    clear_user_data(message.chat.id)
+
+# ---------- /setpermissions ----------
+@bot.message_handler(commands=['setpermissions'])
+def command_setpermissions(message):
+    """
+    Запрашивает у пользователя ссылку на файл, для которого нужно изменить права доступа.
+    """
+    bot.reply_to(message, "Введите ссылку на файл для изменения прав доступа:")
+    set_state(message.chat.id, STATE_PERM_FILE)
+    clear_user_data(message.chat.id)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_PERM_FILE)
+def perm_file_handler(message):
+    """
+    Обрабатывает ссылку на файл.
+    """
+    file_id = extract_file_id(message.text)
+    if not file_id:
+        bot.reply_to(message, "Не удалось извлечь ID файла. Попробуйте ещё раз или введите /cancel для отмены.")
+        return
+    set_user_data(message.chat.id, 'file_id', file_id)
+    bot.reply_to(message, "Введите email пользователя, которому нужно предоставить доступ:")
+    set_state(message.chat.id, STATE_PERM_EMAIL)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_PERM_EMAIL)
+def perm_email_handler(message):
+    """
+    Запрашивает email пользователя.
+    """
+    email = message.text.strip()
+    set_user_data(message.chat.id, 'email', email)
+    bot.reply_to(message, "Введите роль для пользователя (reader, writer, owner):")
+    set_state(message.chat.id, STATE_PERM_ROLE)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == STATE_PERM_ROLE)
+def perm_role_handler(message):
+    """
+    Устанавливает указанную роль пользователю для файла.
+    """
+    role = message.text.strip().lower()
+    if role not in ['reader', 'writer', 'owner']:
+        bot.reply_to(message, "Некорректная роль. Введите одно из: reader, writer, owner:")
+        return
+    file_id = get_user_data(message.chat.id, 'file_id')
+    email = get_user_data(message.chat.id, 'email')
+    try:
+        perm_id = set_file_permission(file_id, email, role)
+        bot.reply_to(message, f"Права доступа успешно изменены. ID созданного разрешения: {perm_id}")
+    except Exception as e:
+        logging.error(f"Ошибка при изменении прав доступа: {e}")
+        bot.reply_to(message, "Произошла ошибка при изменении прав доступа.")
+    set_state(message.chat.id, STATE_NONE)
+    clear_user_data(message.chat.id)
+
+# ---------- Запуск бота ----------
+if __name__ == '__main__':
+    bot.infinity_polling()
