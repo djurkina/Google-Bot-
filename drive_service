@@ -1,0 +1,130 @@
+
+import os
+import pickle
+import re
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+
+SCOPES = ['https://www.googleapis.com/auth/drive']
+
+def get_drive_service():
+    """
+    Получаем объект сервиса для работы с Google Drive API.
+    Если ранее были сохранены учетные данные, они используются повторно.
+    При первом запуске откроется окно/ссылка для авторизации Google.
+    """
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            # credentials.json должен лежать рядом с drive_service.py
+            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+    service = build('drive', 'v3', credentials=creds)
+    return service
+
+def extract_folder_id(url: str) -> str:
+    """
+    Извлекает ID папки из ссылки Google Drive.
+    Пример ссылки: https://drive.google.com/drive/folders/<folder_id>
+    """
+    pattern = r'/folders/([a-zA-Z0-9_-]+)'
+    match = re.search(pattern, url)
+    if match:
+        return match.group(1)
+    else:
+        # Альтернативный вариант для ссылок с параметром id
+        pattern = r'id=([a-zA-Z0-9_-]+)'
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def extract_file_id(url: str) -> str:
+    """
+    Извлекает ID файла из ссылки Google Drive.
+    Пример ссылки: https://drive.google.com/file/d/<file_id>/view?usp=sharing
+    """
+    pattern = r'/file/d/([a-zA-Z0-9_-]+)'
+    match = re.search(pattern, url)
+    if match:
+        return match.group(1)
+    else:
+        pattern = r'id=([a-zA-Z0-9_-]+)'
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def copy_files(source_folder_id: str, dest_folder_id: str) -> int:
+    """
+    Копирует все файлы из папки source_folder_id в папку dest_folder_id.
+    Возвращает количество скопированных файлов.
+    """
+    service = get_drive_service()
+    query = f"'{source_folder_id}' in parents and trashed = false"
+    results = service.files().list(q=query, fields="files(id, name)").execute()
+    items = results.get('files', [])
+    if not items:
+        return 0
+
+    copied_count = 0
+    for item in items:
+        file_id = item['id']
+        file_name = item['name']
+        body = {'name': file_name, 'parents': [dest_folder_id]}
+        try:
+            service.files().copy(fileId=file_id, body=body).execute()
+            copied_count += 1
+        except Exception:
+            # Логируем или пропускаем ошибку
+            pass
+    return copied_count
+
+def move_file(file_id: str, new_parent_id: str):
+    """
+    Перемещает файл file_id в папку new_parent_id.
+    Возвращает обновлённый объект файла (dict).
+    """
+    service = get_drive_service()
+    file_info = service.files().get(fileId=file_id, fields='parents').execute()
+    previous_parents = ",".join(file_info.get('parents', []))
+    updated_file = service.files().update(
+        fileId=file_id,
+        addParents=new_parent_id,
+        removeParents=previous_parents,
+        fields='id, parents'
+    ).execute()
+    return updated_file
+
+def delete_file(file_id: str):
+    """
+    Удаляет файл с заданным file_id.
+    """
+    service = get_drive_service()
+    service.files().delete(fileId=file_id).execute()
+
+def set_file_permission(file_id: str, email: str, role: str) -> str:
+    """
+    Изменяет права доступа к файлу file_id для email с указанной ролью (reader, writer, owner).
+    Возвращает ID созданного разрешения.
+    """
+    service = get_drive_service()
+    permission_body = {
+        'type': 'user',
+        'role': role,
+        'emailAddress': email
+    }
+    result = service.permissions().create(
+        fileId=file_id,
+        body=permission_body,
+        fields='id'
+    ).execute()
+    return result.get('id')
